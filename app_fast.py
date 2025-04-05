@@ -1,22 +1,36 @@
 from fastapi import FastAPI, Form, File, UploadFile, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
+# Changed EmailStr to regular string validation
 from typing import Optional, List, Dict
 import cv2
 import numpy as np
 import face_recognition
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from datetime import date
 import sqlite3
 import json
 import pandas as pd
 import uvicorn
 import shutil
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# Import database, models, and auth utils
+from sqlalchemy.orm import Session
+from config import get_db, init_db
+from model import User, Student, Teacher, FaceEncoding, Attendance
+from auth_utils import hash_password, verify_password, create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 
 # Create FastAPI app
 app = FastAPI()
+
+# OAuth2 scheme for token authentication
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # Add CORS middleware
 app.add_middleware(
@@ -39,6 +53,37 @@ class NameRequest(BaseModel):
     name1: str
     name2: str
 
+# New request models for registration and authentication
+class UserCreate(BaseModel):
+    username: str
+    email: str  # Changed from EmailStr to str to avoid the dependency
+    password: str
+    role: str = "student"  # Default role is student
+
+class StudentCreate(BaseModel):
+    user: UserCreate
+    student_id: str
+    first_name: str
+    last_name: str
+    group_id: Optional[int] = None
+
+class TeacherCreate(BaseModel):
+    user: UserCreate
+    first_name: str
+    last_name: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_db_client():
+    try:
+        init_db()
+    except Exception as e:
+        print(f"Error initializing database: {e}")
+
 @app.get('/new')
 def new_get():
     return {"message": "Everything is okay!"}
@@ -55,7 +100,7 @@ async def name(name1: str = Form(...), image: UploadFile = File(...), name2: Opt
     try:
         # Save the uploaded image
         img_name = name1 + ".png"
-        path = 'C:/Users/User/Desktop/face/face-recognition-attendance-management-system-with-PowerBI-dashboard-main/Training images'
+        path = 'C:/Users/User/Documents/GitHub/ais_face_recognition/Training images'
         
         # Ensure directory exists
         os.makedirs(path, exist_ok=True)
@@ -74,7 +119,7 @@ def name_get():
     return {"status": "error", "message": "All is not well"}
 
 @app.post("/")
-def recognize_post():
+def recognize_post(db: Session = Depends(get_db)):
     path = 'Training images'
     images = []
     classNames = []
@@ -104,45 +149,128 @@ def recognize_post():
             encodeList.append(encode)
         return encodeList
 
-    def markData(name):
+    def markData(name, db_session):
         now = datetime.now()
         dtString = now.strftime('%H:%M')
-        today = date.today()
+        today_date = str(date.today())
+        
+        # Create new attendance record directly using SQLite
+        # instead of using potentially mismatched SQLAlchemy model
         conn = sqlite3.connect('information.db')
-        conn.execute('''CREATE TABLE IF NOT EXISTS Attendance
-                        (NAME TEXT  NOT NULL,
-                         Time  TEXT NOT NULL ,Date TEXT NOT NULL)''')
-
-        conn.execute("INSERT or Ignore into Attendance (NAME,Time,Date) values (?,?,?)", (name, dtString, today,))
-        conn.commit()
-        cursor = conn.execute("SELECT NAME,Time,Date from Attendance")
+        cur = conn.cursor()
+        
+        # Check if the record already exists
+        cur.execute("SELECT * FROM Attendance WHERE NAME=? AND Date=?", (name, today_date))
+        existing_record = cur.fetchone()
+        
+        # Insert only if record doesn't exist
+        if not existing_record:
+            cur.execute("INSERT INTO Attendance (NAME, Time, Date) VALUES (?, ?, ?)", 
+                      (name, dtString, today_date))
+            conn.commit()
+            
+        # Get the data for return
+        cur.execute("SELECT NAME, Time, Date FROM Attendance WHERE NAME=? AND Date=?", 
+                   (name, today_date))
+        record = cur.fetchone()
         conn.close()
-        return {"name": name, "time": dtString, "date": str(today)}
+        
+        return {"name": record[0], "time": record[1], "date": record[2]}
+
+    def send_late_email(student_name, arrival_time, date_str):
+        """Send email notification for late arrival"""
+        sender_email = "jafarman2007@gmail.com"
+        receiver_email = "berdyshev.k07@gmail.com"
+        password = "rkjt yvtp gbpu qbaz"  # App password
+        
+        # Create message
+        message = MIMEMultipart()
+        message["From"] = sender_email
+        message["To"] = receiver_email
+        message["Subject"] = f"Late Arrival Notification: {student_name}"
+        
+        # Email content
+        body = f"""
+        Late Arrival Notification
+        
+        Student: {student_name}
+        Date: {date_str}
+        Arrival Time: {arrival_time}
+        
+        This student has arrived after the 8:20 AM cutoff time.
+        """
+        message.attach(MIMEText(body, "plain"))
+        
+        # Connect to server and send email
+        try:
+            server = smtplib.SMTP("smtp.gmail.com", 587)
+            server.starttls()
+            server.login(sender_email, password)
+            server.sendmail(sender_email, receiver_email, message.as_string())
+            server.quit()
+            print(f"Late notification email sent for {student_name}")
+        except Exception as e:
+            print(f"Failed to send email: {str(e)}")
 
     def markAttendance(name):
-        with open('attendance.csv', 'r+', errors='ignore') as f:
-            myDataList = f.readlines()
-            nameList = []
-            for line in myDataList:
-                entry = line.split(',')
-                nameList.append(entry[0])
-            if name not in nameList:
-                now = datetime.now()
-                dtString = now.strftime('%H:%M')
-                f.writelines(f'\n{name},{dtString}')
+        # Use SQLite database instead of CSV file
+        now = datetime.now()
+        dtString = now.strftime('%H:%M')
+        today_date = str(date.today())
+        
+        # Connect to the database
+        conn = sqlite3.connect('information.db')
+        cur = conn.cursor()
+        
+        # Check if any record exists for this person today
+        cur.execute("SELECT Time FROM Attendance WHERE NAME=? AND Date=? ORDER BY Time DESC", (name, today_date))
+        existing_record = cur.fetchone()
+        
+        should_insert = True
+        
+        # If a record exists, check the time difference
+        if existing_record:
+            last_time = existing_record[0]
+            
+            # Parse the time from the last record (format: HH:MM)
+            last_time_parts = last_time.split(':')
+            last_datetime = datetime(
+                now.year, now.month, now.day, 
+                int(last_time_parts[0]), int(last_time_parts[1])
+            )
+            
+            # Calculate time difference in minutes
+            time_diff = (now - last_datetime).total_seconds() / 60
+            
+            # Only insert if more than 1 minute has passed
+            should_insert = time_diff > 1
+        
+        # Insert only if no record exists or if time difference > 1 minute
+        if should_insert:
+            cur.execute("INSERT INTO Attendance (NAME, Time, Date) VALUES (?, ?, ?)", 
+                      (name, dtString, today_date))
+            conn.commit()
+            
+            # Check if it's this person's first entry today and if they're late
+            if not existing_record:
+                # Create a cutoff time for 8:20 AM
+                cutoff_hour, cutoff_minute = 8, 20
+                
+                # Check if current time is after 8:20 AM
+                if (now.hour > cutoff_hour or 
+                    (now.hour == cutoff_hour and now.minute > cutoff_minute)):
+                    # Send late notification email
+                    send_late_email(name, dtString, today_date)
+        
+        conn.close()
 
     encodeListKnown = findEncodings(images)
     
     # In a real API, implement this as a background task or separate service
     cap = cv2.VideoCapture(0)
     recognized_people = []
-    counter = 0
     while True:
-        if counter == 100:
-            counter = 0
-            images, classNames = update_images()
-            encodeListKnown = findEncodings(images)
-        counter += 1
+        
         success, img = cap.read()
         imgS = cv2.resize(img, (0, 0), None, 0.25, 0.25)
         imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
@@ -158,7 +286,7 @@ def recognize_post():
             if faceDis[matchIndex] < 0.50:
                 name = classNames[matchIndex].upper()
                 markAttendance(name)
-                attendance_data = markData(name)
+                attendance_data = markData(name, db)
                 recognized_people.append(attendance_data)
             else:
                 name = 'Unknown'
@@ -183,20 +311,184 @@ def recognize_post():
 def recognize_get():
     return {"message": "Use POST request to start face recognition"}
 
+# Registration routes
+@app.post("/register/student", response_model=dict)
+async def register_student(student: StudentCreate, db: Session = Depends(get_db)):
+    """
+    Register a new student user
+    """
+    # Check if user with the same username or email exists
+    db_user = db.query(User).filter(
+        (User.username == student.user.username) | (User.email == student.user.email)
+    ).first()
+    
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username or email already registered")
+    
+    # Create new user
+    new_user = User(
+        username=student.user.username,
+        email=student.user.email,
+        hashed_password=hash_password(student.user.password),
+        role="student"
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    # Create student profile
+    new_student = Student(
+        user_id=new_user.id,
+        student_id=student.student_id,
+        first_name=student.first_name,
+        last_name=student.last_name,
+        group_id=student.group_id
+    )
+    db.add(new_student)
+    db.commit()
+    
+    return {
+        "status": "success", 
+        "message": "Student registered successfully", 
+        "user_id": new_user.id
+    }
+
+@app.post("/register/teacher", response_model=dict)
+async def register_teacher(teacher: TeacherCreate, db: Session = Depends(get_db)):
+    """
+    Register a new teacher user
+    """
+    # Check if user with the same username or email exists
+    db_user = db.query(User).filter(
+        (User.username == teacher.user.username) | (User.email == teacher.user.email)
+    ).first()
+    
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username or email already registered")
+    
+    # Create new user
+    new_user = User(
+        username=teacher.user.username,
+        email=teacher.user.email,
+        hashed_password=hash_password(teacher.user.password),
+        role="teacher"
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    # Create teacher profile
+    new_teacher = Teacher(
+        user_id=new_user.id,
+        first_name=teacher.first_name,
+        last_name=teacher.last_name
+    )
+    db.add(new_teacher)
+    db.commit()
+    
+    return {
+        "status": "success", 
+        "message": "Teacher registered successfully", 
+        "user_id": new_user.id
+    }
+
+# Login routes
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """
+    OAuth2 compatible token login, returns JWT token
+    """
+    # Find user by username
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Generate access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username, "role": user.role, "user_id": user.id},
+        expires_delta=access_token_expires
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Update existing login route to use database
 @app.post('/login')
-def login(request: LoginRequest):
+def login(request: LoginRequest, db: Session = Depends(get_db)):
     username = request.username
     password = request.password
     
-    df = pd.read_csv('cred.csv')
-    if len(df.loc[df['username'] == username]['password'].values) > 0:
-        if df.loc[df['username'] == username]['password'].values[0] == password:
-            sessions[username] = True
-            return {"status": "success", "username": username}
-        else:
-            return {"status": "failed", "message": "Invalid password"}
+    # Check credentials against database
+    user = db.query(User).filter(User.username == username).first()
+    if user and verify_password(password, user.hashed_password):
+        # Generate JWT token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.username, "role": user.role, "user_id": user.id},
+            expires_delta=access_token_expires
+        )
+        
+        # Store in sessions for backward compatibility
+        sessions[username] = True
+        
+        return {
+            "status": "success", 
+            "username": username,
+            "access_token": access_token,
+            "token_type": "bearer",
+            "role": user.role
+        }
     else:
-        return {"status": "failed", "message": "User not found"}
+        return {"status": "failed", "message": "Invalid username or password"}
+
+# User profile endpoint
+@app.get("/users/me", response_model=dict)
+async def get_user_profile(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
+    """
+    Get current user profile information
+    """
+    from auth_utils import verify_access_token
+    
+    # Verify token and get user information
+    payload = verify_access_token(token)
+    if not payload:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token or token expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    username = payload.get("sub")
+    user = db.query(User).filter(User.username == username).first()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get additional profile information based on role
+    profile_data = {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "role": user.role,
+    }
+    
+    if user.role == "student" and user.student:
+        profile_data.update({
+            "student_id": user.student.student_id,
+            "first_name": user.student.first_name,
+            "last_name": user.student.last_name,
+        })
+    elif user.role == "teacher" and user.teacher:
+        profile_data.update({
+            "first_name": user.teacher.first_name,
+            "last_name": user.teacher.last_name,
+        })
+    
+    return profile_data
 
 @app.get('/checklogin')
 def checklogin(username: Optional[str] = None):
