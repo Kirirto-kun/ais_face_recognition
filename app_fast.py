@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Form, File, UploadFile, Depends, HTTPException
+from fastapi import FastAPI, Form, File, UploadFile, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -19,6 +19,9 @@ import shutil
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 # Import database, models, and auth utils
 from sqlalchemy.orm import Session
@@ -118,6 +121,48 @@ async def name(name1: str = Form(...), image: UploadFile = File(...), name2: Opt
 def name_get():
     return {"status": "error", "message": "All is not well"}
 
+def send_email_threaded(student_name, arrival_time, date_str):
+    """Send email in a separate thread so it doesn't block the main application"""
+    sender_email = "jafarman2007@gmail.com"
+    receiver_email = "mazitovdzafar32@gmail.com"
+    password = "rkjt yvtp gbpu qbaz"  # App password
+    
+    # Create message
+    message = MIMEMultipart()
+    message["From"] = sender_email
+    message["To"] = receiver_email
+    message["Subject"] = f"Late Arrival Notification: {student_name}"
+    
+    # Email content
+    body = f"""
+    Late Arrival Notification
+    
+    Student: {student_name}
+    Date: {date_str}
+    Arrival Time: {arrival_time}
+    
+    This student has arrived after the 8:20 AM cutoff time.
+    """
+    message.attach(MIMEText(body, "plain"))
+    
+    def send_email_task():
+        try:
+            print(f"Starting to send email for {student_name}...")
+            server = smtplib.SMTP("smtp.gmail.com", 587)
+            server.starttls()
+            server.login(sender_email, password)
+            server.sendmail(sender_email, receiver_email, message.as_string())
+            server.quit()
+            print(f"Email sent successfully for {student_name}")
+        except Exception as e:
+            print(f"Failed to send email: {str(e)}")
+    
+    # Start a new thread to send the email immediately
+    email_thread = threading.Thread(target=send_email_task)
+    email_thread.daemon = True  # Thread will exit when main program exits
+    email_thread.start()
+    print(f"Email thread started for {student_name}")
+
 @app.post("/")
 def recognize_post(db: Session = Depends(get_db)):
     path = 'Training images'
@@ -178,9 +223,9 @@ def recognize_post(db: Session = Depends(get_db)):
         return {"name": record[0], "time": record[1], "date": record[2]}
 
     def send_late_email(student_name, arrival_time, date_str):
-        """Send email notification for late arrival"""
+        """Send email notification for late arrival in a non-blocking way"""
         sender_email = "jafarman2007@gmail.com"
-        receiver_email = "berdyshev.k07@gmail.com"
+        receiver_email = "mazitovdzafar32@gmail.com"
         password = "rkjt yvtp gbpu qbaz"  # App password
         
         # Create message
@@ -201,8 +246,9 @@ def recognize_post(db: Session = Depends(get_db)):
         """
         message.attach(MIMEText(body, "plain"))
         
-        # Connect to server and send email
+        # Using a separate function to send email
         try:
+            # This function runs in a separate thread/process, so it won't block the camera
             server = smtplib.SMTP("smtp.gmail.com", 587)
             server.starttls()
             server.login(sender_email, password)
@@ -259,8 +305,8 @@ def recognize_post(db: Session = Depends(get_db)):
                 # Check if current time is after 8:20 AM
                 if (now.hour > cutoff_hour or 
                     (now.hour == cutoff_hour and now.minute > cutoff_minute)):
-                    # Send late notification email
-                    send_late_email(name, dtString, today_date)
+                    # Send email in a separate thread that starts immediately
+                    send_email_threaded(name, dtString, today_date)
         
         conn.close()
 
@@ -506,23 +552,89 @@ def data():
     conn = sqlite3.connect('information.db')
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cursor = cur.execute("SELECT DISTINCT NAME,Time, Date from Attendance where Date=?", (today,))
+    # Modified query to get ALL records for today (removed DISTINCT)
+    cursor = cur.execute("SELECT NAME, Time, Date from Attendance where Date=?", (today,))
     rows = cur.fetchall()
+    print("rows", rows)
+    # Define class schedule
+    class_schedule = [
+        {"class": 1, "start": "08:20", "end": "09:00"},
+        {"class": 2, "start": "09:10", "end": "09:50"},
+        {"class": 3, "start": "10:00", "end": "10:40"},
+        {"class": 4, "start": "10:50", "end": "11:30"},
+        {"class": 5, "start": "11:40", "end": "12:20"},
+        {"class": 6, "start": "12:30", "end": "13:10"},
+        {"class": 7, "start": "13:20", "end": "14:00"},
+        {"class": 8, "start": "14:10", "end": "14:50"}
+    ]
     
-    result = []
+    # Function to determine attendance status
+    def check_attendance_status(time_str):
+        time_obj = datetime.strptime(time_str, "%H:%M").time()
+        
+        for lesson in class_schedule:
+            class_start = datetime.strptime(lesson["start"], "%H:%M").time()
+            class_end = datetime.strptime(lesson["end"], "%H:%M").time()
+            
+            # Calculate break start/end
+            break_start = class_end
+            next_class_index = lesson["class"]
+            if next_class_index < len(class_schedule):
+                break_end = datetime.strptime(class_schedule[next_class_index]["start"], "%H:%M").time()
+            else:
+                break_end = None
+                
+            # Check if time falls within this class period
+            if class_start <= time_obj <= class_end:
+                # Late if more than 5 minutes after start
+                late_threshold = (datetime.combine(date.today(), class_start) + timedelta(minutes=5)).time()
+                if time_obj <= late_threshold:
+                    return {"class": lesson["class"], "status": "on time"}
+                else:
+                    return {"class": lesson["class"], "status": "late"}
+            
+            # Check if time falls within break period
+            if break_end and break_start <= time_obj <= break_end:
+                return {"class": lesson["class"], "status": "break", "next_class": lesson["class"] + 1}
+        
+        # Before first class
+        if time_obj < datetime.strptime(class_schedule[0]["start"], "%H:%M").time():
+            return {"class": 1, "status": "before school"}
+        # After last class
+        elif time_obj > datetime.strptime(class_schedule[-1]["end"], "%H:%M").time():
+            return {"class": 8, "status": "after school"}
+        
+        return {"class": None, "status": "unknown"}
+    
+    # Group attendance data by name
+    attendance_by_name = {}
     for row in rows:
-        result.append({
-            "name": row[0],
-            "time": row[1],
-            "date": str(row[2])
+        print(row)
+        name = row[0]
+        time_str = row[1]
+        date_str = row[2]
+        
+        if name not in attendance_by_name:
+            attendance_by_name[name] = {
+                "name": name,
+                "date": str(date_str),
+                "times": [],
+                "attendance_info": []
+            }
+        
+        # Add time entry
+        attendance_by_name[name]["times"].append(time_str)
+        
+        # Add attendance status
+        attendance_status = check_attendance_status(time_str)
+        attendance_by_name[name]["attendance_info"].append({
+            "time": time_str,
+            "class": attendance_status["class"],
+            "status": attendance_status["status"]
         })
     
     conn.close()
-    return {"status": "success", "attendance_data": result}
-
-@app.get('/data')
-def data_get():
-    return {"message": "Use POST to retrieve today's attendance data"}
+    return {"status": "success", "attendance_data": list(attendance_by_name.values())}
 
 @app.get('/whole')
 def whole():
