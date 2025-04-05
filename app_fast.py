@@ -84,7 +84,16 @@ def recognize_post():
         curImg = cv2.imread(f'{path}/{cl}')
         images.append(curImg)
         classNames.append(os.path.splitext(cl)[0])
-
+    def update_images():
+        images = []
+        classNames = []
+        myList = os.listdir(path)
+        for cl in myList:
+            curImg = cv2.imread(f'{path}/{cl}')
+            images.append(curImg)
+            classNames.append(os.path.splitext(cl)[0])
+        return images, classNames
+    
     def findEncodings(images):
         encodeList = []
         for img in images:
@@ -127,8 +136,13 @@ def recognize_post():
     # In a real API, implement this as a background task or separate service
     cap = cv2.VideoCapture(0)
     recognized_people = []
-    
+    counter = 0
     while True:
+        if counter == 100:
+            counter = 0
+            images, classNames = update_images()
+            encodeListKnown = findEncodings(images)
+        counter += 1
         success, img = cap.read()
         imgS = cv2.resize(img, (0, 0), None, 0.25, 0.25)
         imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
