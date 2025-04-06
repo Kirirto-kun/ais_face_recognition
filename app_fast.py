@@ -29,6 +29,10 @@ from config import get_db, init_db
 from model import User, Student, Teacher, FaceEncoding, Attendance
 from auth_utils import hash_password, verify_password, create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 
+from printer.createopbad import main_1, main_1_async
+# Import the async printing function
+from printer.printer_image import print_image_async
+
 # Create FastAPI app
 app = FastAPI()
 
@@ -293,6 +297,33 @@ def recognize_post(db: Session = Depends(get_db)):
         
         # Insert only if no record exists or if time difference > 1 minute
         if should_insert:
+            dictionary = {
+                "MAKSIM": "070517551794",
+                "JAFAR": "070708551158",
+                "KEREY": "071004553794",
+                "AZIZ": "080424552629"
+            }
+            # Use the asynchronous version to run in a separate thread
+            # This won't block the camera or face recognition processing
+            def on_certificate_complete(success, result):
+                if success:
+                    print(f"Certificate for {name} created successfully")
+                    # After certificate is created successfully, print it asynchronously
+                    def on_print_complete(print_success, print_result):
+                        if print_success:
+                            print(f"Certificate for {name} printed successfully")
+                        else:
+                            print(f"Failed to print certificate for {name}: {print_result}")
+                    
+                    # Start printing in a separate thread
+                    output_image_path = "printer/output.jpg"  # Use the path from createopbad.py
+                    print_image_async(output_image_path, callback=on_print_complete)
+                else:
+                    print(f"Failed to create certificate for {name}: {result}")
+            
+            # Start the certificate creation in a separate thread
+            main_1_async(dictionary[name], callback=on_certificate_complete)
+            
             cur.execute("INSERT INTO Attendance (NAME, Time, Date) VALUES (?, ?, ?)", 
                       (name, dtString, today_date))
             conn.commit()
