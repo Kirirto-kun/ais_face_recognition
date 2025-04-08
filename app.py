@@ -9,7 +9,6 @@ import uvicorn
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
-# Create FastAPI app
 app = FastAPI()
 
 # Add CORS middleware
